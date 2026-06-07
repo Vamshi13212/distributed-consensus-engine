@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify
+from crypto_utils import *
 
 import os
 import socket
@@ -19,7 +20,7 @@ app = Flask(__name__)
 NODE_ID = int(os.getenv("NODE_ID", "1"))
 
 HOSTNAME = socket.gethostname()
-
+private_key, public_key = generate_key_pair()
 # =====================================================
 # Cluster Configuration
 # =====================================================
@@ -51,6 +52,20 @@ proposal_number = 0
 highest_prepare_seen = 0
 
 accepted_value = None
+
+# =====================================================
+# PBFT State
+# =====================================================
+
+view_number = 1
+
+sequence_number = 0
+
+prepare_votes = {}
+
+commit_votes = {}
+
+pbft_committed = set()
 
 # =====================================================
 # Bully Leader Election
@@ -89,6 +104,44 @@ def bully_election():
                 f"[Node {NODE_ID}] New Leader Elected -> Node {leader_id}"
             )
 
+#
+def create_signed_payload(message):
+
+    signature = sign_message(
+        private_key,
+        message
+    )
+
+    return signature.hex()
+
+
+def verify_payload_signature(
+    sender_public_key,
+    message,
+    signature_hex
+):
+
+    try:
+
+        signature = bytes.fromhex(
+            signature_hex
+        )
+
+        return verify_signature(
+            sender_public_key,
+            message,
+            signature
+        )
+
+    except:
+
+        return False
+
+
+node_public_keys = {
+    NODE_ID: public_key
+}
+#
 # =====================================================
 # Heartbeat Endpoint
 # =====================================================
@@ -315,6 +368,236 @@ def run_paxos(txn):
 
     return False
 
+
+@app.route("/pre_prepare", methods=["POST"])
+def pre_prepare():
+
+    data = request.get_json()
+
+    txn = data["txn"]
+
+    sequence = data["sequence"]
+
+    signature = data["signature"]
+
+    print(
+        f"[Node {NODE_ID}] PRE-PREPARE received"
+    )
+
+    return jsonify({
+        "status": "accepted",
+        "node_id": NODE_ID
+    })
+
+@app.route("/prepare_pbft", methods=["POST"])
+def prepare_pbft():
+
+    global prepare_votes
+
+    data = request.get_json()
+
+    sequence = data["sequence"]
+
+    if sequence not in prepare_votes:
+
+        prepare_votes[sequence] = set()
+
+    prepare_votes[sequence].add(
+        data["node_id"]
+    )
+
+    return jsonify({
+        "prepared": True,
+        "votes":
+            len(
+                prepare_votes[sequence]
+            )
+    })
+
+@app.route("/commit_pbft", methods=["POST"])
+def commit_pbft():
+
+    global commit_votes
+
+    data = request.get_json()
+
+    sequence = data["sequence"]
+
+    if sequence not in commit_votes:
+
+        commit_votes[sequence] = set()
+
+    commit_votes[sequence].add(
+        data["node_id"]
+    )
+
+    return jsonify({
+        "committed": True,
+        "votes":
+            len(
+                commit_votes[sequence]
+            )
+    })
+
+def run_pbft(txn):
+
+    global sequence_number
+
+    sequence_number += 1
+
+    sequence = sequence_number
+
+    message = str(txn)
+
+    signature = create_signed_payload(
+        message
+    )
+
+    # ==========================
+    # PRE-PREPARE
+    # ==========================
+
+    pre_prepare_count = 0
+
+    for node_id, url in nodes.items():
+
+        try:
+
+            response = requests.post(
+                f"{url}/pre_prepare",
+                json={
+                    "txn": txn,
+                    "sequence": sequence,
+                    "signature": signature
+                },
+                timeout=2
+            )
+
+            if response.status_code == 200:
+
+                pre_prepare_count += 1
+
+        except:
+
+            pass
+
+    print(
+        f"PRE-PREPARE ACKS = {pre_prepare_count}"
+    )
+
+    # ==========================
+    # PREPARE
+    # ==========================
+
+    prepare_count = 0
+
+    for node_id, url in nodes.items():
+
+        try:
+
+            response = requests.post(
+                f"{url}/prepare_pbft",
+                json={
+                    "sequence": sequence,
+                    "node_id": NODE_ID
+                },
+                timeout=2
+            )
+
+            result = response.json()
+
+            if result["prepared"]:
+
+                prepare_count += 1
+
+        except:
+
+            pass
+
+    print(
+        f"PREPARE VOTES = {prepare_count}"
+    )
+
+    if prepare_count < 3:
+
+        return False
+
+    # ==========================
+    # COMMIT
+    # ==========================
+
+    commit_count = 0
+
+    for node_id, url in nodes.items():
+
+        try:
+
+            response = requests.post(
+                f"{url}/commit_pbft",
+                json={
+                    "sequence": sequence,
+                    "node_id": NODE_ID
+                },
+                timeout=2
+            )
+
+            result = response.json()
+
+            if result["committed"]:
+
+                commit_count += 1
+
+        except:
+
+            pass
+
+    print(
+        f"COMMIT VOTES = {commit_count}"
+    )
+
+    if commit_count >= 3:
+
+        ledger.append(txn)
+
+        pbft_committed.add(sequence)
+
+        print(
+            f"PBFT COMMIT SUCCESS {txn}"
+        )
+
+        return True
+
+    return False
+
+@app.route(
+    "/pbft_transaction",
+    methods=["POST"]
+)
+def pbft_transaction():
+
+    if NODE_ID != leader_id:
+
+        return jsonify({
+            "status": "rejected",
+            "leader_id": leader_id
+        }), 400
+
+    data = request.get_json()
+
+    success = run_pbft(data)
+
+    if success:
+
+        return jsonify({
+            "status": "committed",
+            "mode": "PBFT"
+        })
+
+    return jsonify({
+        "status": "failed"
+    }), 500
+
+
 # =====================================================
 # Home Endpoint
 # =====================================================
@@ -425,6 +708,51 @@ def clear_ledger():
         "status": "cleared",
         "node_id": NODE_ID
     })
+
+
+def create_signed_message(message):
+
+    signature = sign_message(
+        private_key,
+        message
+    )
+
+    return {
+        "message": message,
+        "signature": signature.hex()
+    }
+
+def verify_signed_message(
+    sender_public_key,
+    message,
+    signature_hex
+):
+
+    signature = bytes.fromhex(
+        signature_hex
+    )
+
+    return verify_signature(
+        sender_public_key,
+        message,
+        signature
+    )
+
+@app.route("/pbft_test")
+def pbft_test():
+
+    message = "TEST_PBFT"
+
+    signed = create_signed_message(
+        message
+    )
+
+    return jsonify({
+        "message": signed["message"],
+        "signature":
+            signed["signature"][:50]
+    })
+
 
 # =====================================================
 # Main

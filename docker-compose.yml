@@ -39,3 +39,12 @@ services:
       NODE_ID: 5
     ports:
       - "5005:5000"
+  
+  adversary:
+    build: .
+    container_name: adversary
+    environment:
+      NODE_ID: 99
+    command: python src/adversary.py
+    ports:
+      - "5099:5000"
